@@ -4571,9 +4571,19 @@ private:
 
                         slot.init_sampler();
                     } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // skip ordinary mid-prompt checkpoints
+                        if (params_base.checkpoint_every_nt > 0) {
+                            llama_pos last_checkpoint = 0;
+                            if (!slot.prompt.checkpoints.empty()) {
+                                last_checkpoint = slot.prompt.checkpoints.back().n_tokens;
+                            }
+
+                            if (slot.prompt.n_tokens() - n_tokens_cur - last_checkpoint < params_base.checkpoint_every_nt) {
+                                do_checkpoint = false;
+                            } else if (do_checkpoint) {
+                                SLT_INF(slot, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n", params_base.checkpoint_every_nt, last_checkpoint, slot.prompt.n_tokens());
+                            }
+                        } else if (!is_user_start && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
