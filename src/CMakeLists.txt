@@ -63,6 +63,10 @@ set_target_properties(llama PROPERTIES
 set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
+if (GGML_CUDA)
+    target_compile_definitions(llama PRIVATE AGRILLA_HAS_CUDA)
+endif()
+
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})

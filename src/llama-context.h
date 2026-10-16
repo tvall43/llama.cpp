@@ -310,6 +310,9 @@ private:
 
     const llama_model & model;
 
+    // moe-bracket: metadata context per i tensori Q8_0 degli step per blocco
+    ggml_context * moe_bracket_ctx = nullptr;
+
     llama_cparams cparams;
 
     llama_adapter_cvec_ptr  cvec;
@@ -469,4 +472,9 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // MoE expert expansion observability (experts/token per layer)
+    std::vector<double>   moe_stats_acc; // per-trunk-layer sum of selected experts
+    std::vector<uint64_t> moe_stats_tok; // per-trunk-layer tokens observed
+    uint64_t moe_stats_tokens  = 0;      // tokens observed since the last report
 };

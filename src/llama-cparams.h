@@ -61,6 +61,19 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
+    // MoE expert expansion, resolved against the loaded model (0 = disabled)
+    // moe_experts is the max routed-expert budget N; expansion applies to trunk
+    // layers il with moe_layer_start <= il <= moe_layer_end (inclusive)
+    int32_t  moe_experts = 0;
+    int32_t  moe_experts_native = 0; // the model's native top-K (for the decay ramp)
+    float    moe_expert_threshold = 0.0f;
+    float    moe_expert_decay_end = 0.5f;
+    bool     moe_no_expert_decay = false;
+    int32_t  moe_layer_start = 0;
+    int32_t  moe_layer_end = 0;
+    int32_t  moe_expert_renorm = 0; // kept-weight renormalization: 0 auto (follow stock), 1 always, 2 never
+    uint32_t moe_stats_every = 0; // print experts/token stats every N decoded tokens (0 = off)
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 

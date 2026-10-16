@@ -1,5 +1,15 @@
 #include "llama-graph.h"
 
+// moe-predict: attiva l'esposizione dei tensori di routing quando e' richiesta
+// la registrazione per-token degli esperti (LLAMA_MOE_EXPERT_LOG=file.jsonl)
+static bool ggml_moe_expert_log_enabled() {
+    static const bool enabled = getenv("LLAMA_MOE_EXPERT_LOG") != nullptr ||
+                                getenv("LLAMA_MOE_EXPERT_PREFETCH") != nullptr ||
+                                getenv("LLAMA_MOE_CHUNK_PREDICT") != nullptr;
+    return enabled;
+}
+#include "llama-moe-expansion.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -24,6 +34,11 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+// moe-bracket (definito in llama-context.cpp): step per blocco esperti
+extern std::map<int, std::array<ggml_tensor *, 4>> g_moe_bracket_map;
+extern float g_moe_bracket_alpha;
+extern bool  g_moe_bracket_on;
 
 // dedup helpers
 
@@ -1417,6 +1432,9 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    moe_expert_counts.clear();
+    moe_expert_logs.clear();
+
     params = {};
 
     inputs.clear();
@@ -1547,6 +1565,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     model            (*params.model),
     arch             (params.arch),
+    gtype            (params.gtype),
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
@@ -2158,6 +2177,22 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// ===== moe-reduce: potatura dinamica dei punteggi bassi (inverso dell'expansion) =====
+// LLAMA_MOE_REDUCE=X (0=off, es. 0.995): dopo la selezione top-K mantieni solo
+// gli esperti con peso >= X * peso(top-1), poi rinormalizza. Statistiche degli
+// esperti mantenuti per layer in moe_reduce_kept (lette in llama-context).
+float g_moe_reduce_factor = 0.0f;        // condivise con llama-context (statistiche)
+int   g_moe_reduce_lstart = 0;
+int   g_moe_reduce_lend   = -1;          // -1 = tutti
+static bool  g_moe_reduce_init   = false;
+static void moe_reduce_init_from_env() {
+    if (g_moe_reduce_init) return;
+    g_moe_reduce_init = true;
+    if (const char * e = getenv("LLAMA_MOE_REDUCE")) g_moe_reduce_factor = atof(e);
+    if (const char * e = getenv("LLAMA_MOE_REDUCE_START")) g_moe_reduce_lstart = atoi(e);
+    if (const char * e = getenv("LLAMA_MOE_REDUCE_END"))   g_moe_reduce_lend   = atoi(e);
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2236,6 +2271,48 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    // MoE expert expansion (docs/moe-expansion.md): raise the routed-expert
+    // budget above the model's native top-K on the requested layers, with an
+    // optional dynamic threshold cut and a linear influence decay on the extra
+    // ranks.
+    //
+    // universal across router families: the post-pass only needs positive,
+    // rank-orderable scores, so every router that produces them is supported -
+    // softmax (qwen*, glm4-moe, lfm2moe, olmoe, mixtral, ...), sigmoid with
+    // weight normalization (glm-dsa/GLM-5.x, ...), softmax-of-selected-scores
+    // (openai-moe/gpt-oss) and sqrt-softplus (deepseek4); precomputed router
+    // logits (probs_in, e.g. gemma4) are fine too since the gating softmax
+    // normalizes them. excluded: MTP/draft graphs, grouped expert routing,
+    // custom expert selections and models that apply the weights before the
+    // FFN without normalization (llama4) - those keep the native routing.
+    // with the feature off (or N == K and no threshold) the graph is exactly
+    // the stock one.
+    const bool moe_expand =
+        !cparams.warmup &&
+        cparams.moe_experts > 0 &&
+        il >= cparams.moe_layer_start && il <= cparams.moe_layer_end &&
+        gtype != LLM_GRAPH_TYPE_DECODER_MTP &&
+        (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX ||
+         gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID ||
+         gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT ||
+         gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) &&
+        !weight_before_ffn &&
+        hparams.n_expert_groups <= 1 &&
+        selected_experts_in == nullptr &&
+        n_expert == hparams.n_expert &&
+        n_expert_used == (int64_t) hparams.n_expert_used() &&
+        (cparams.moe_experts != (int64_t) n_expert_used || cparams.moe_expert_threshold > 0.0f);
+
+    // N: routed-expert budget for this layer (== n_expert_used when not expanding)
+    const int64_t n_used = moe_expand ? (int64_t) cparams.moe_experts : n_expert_used;
+
+    // weight renormalization after cut+decay: "auto" follows the model's stock
+    // normalization (renorm on for softmax routers with norm_w, off for raw-score
+    // routers like DeepSeek-V4's sqrt-softplus with expert_weights_norm=false)
+    const bool moe_renorm =
+        cparams.moe_expert_renorm == 1 ||                     // always
+        (cparams.moe_expert_renorm == 0 && norm_w);           // auto -> follow stock
 
     ggml_tensor * logits = nullptr;
 
@@ -2324,7 +2401,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_used); // [n_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
@@ -2338,18 +2415,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
-        weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        weights = ggml_reshape_2d(ctx0, weights, n_used, n_tokens);
+        weights = ggml_soft_max(ctx0, weights); // [n_used, n_tokens]
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_used, n_tokens);
         cb(weights, "ffn_moe_weights_softmax", il);
     }
 
-    if (norm_w) {
+    if (moe_expand) {
+        // expert-budget expansion post-pass: threshold cut + influence decay +
+        // renormalization (replaces the stock norm_w below, same sum-to-1
+        // semantics; w_scale is still applied afterwards as usual)
+        ggml_tensor * sel_count_out = nullptr;
+        weights = build_moe_expansion_weights(ctx0, weights, n_used, n_expert_used,
+                cparams.moe_expert_threshold, cparams.moe_expert_decay_end,
+                cparams.moe_no_expert_decay, moe_renorm,
+                cparams.moe_stats_every > 0 ? &sel_count_out : nullptr);
+        cb(weights, "ffn_moe_weights_expanded", il);
+
+        if (sel_count_out) {
+            // mark as graph output: with no consumer downstream, the allocator
+            // would otherwise recycle its buffer during the compute (the host
+            // reads it back only after the whole graph has run)
+            ggml_set_output(sel_count_out);
+            ggml_build_forward_expand(gf, sel_count_out);
+            // note: weights->ne[2] is the number of tokens this layer's FFN
+            // processes in this graph: late layers may see fewer tokens than the
+            // ubatch when the output-token optimization truncates the last layers
+            res->moe_expert_counts[il] = { sel_count_out, (int) weights->ne[2] };
+        }
+
+        // per-token expert logging (moe-predict): espone gli id candidati e i
+        // pesi post-espansione (>0 = esperto tenuto) per il readback su host
+        if (ggml_moe_expert_log_enabled()) {
+            ggml_set_output(selected_experts);
+            ggml_build_forward_expand(gf, selected_experts);
+            ggml_set_output(weights);
+            ggml_build_forward_expand(gf, weights);
+            res->moe_expert_logs[il] = { selected_experts, weights, (int) weights->ne[2], (int) n_used, (int) n_expert,
+            { gate_up_exps ? gate_up_exps : up_exps, gate_up_exps ? down_exps : gate_exps, down_exps } };
+        }
+    } else if (norm_w) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
@@ -2369,9 +2479,55 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
+
+    // moe-reduce: potatura dinamica (solo ramo stock; l'expansione ha la sua scala)
+    moe_reduce_init_from_env();
+    if (g_moe_reduce_factor > 0.0f && il >= g_moe_reduce_lstart &&
+        (g_moe_reduce_lend < 0 || il <= g_moe_reduce_lend)) {
+        const int64_t mr_rows = weights->ne[1];
+        const int64_t mr_tok  = weights->ne[2];
+        ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, mr_rows, mr_tok);     // [rows, tok]
+        ggml_tensor * w1 = ggml_reshape_3d(ctx0, w2, 1, mr_rows, mr_tok);       // [1, rows, tok]
+        // top1 value per token: argsort discendente per colonna, poi gather dei
+        // valori con gli id 2D (stesso pattern di get_rows(probs, selected_experts)
+        // sopra) e vista della riga 0 = peso del top-1 per token
+        ggml_tensor * srt_idx = ggml_argsort(ctx0, w2, GGML_SORT_ORDER_DESC);   // [rows, tok]
+        ggml_tensor * srt_val = ggml_get_rows(ctx0, w1, srt_idx);               // [1, rows, tok]
+        ggml_tensor * top1_val = ggml_view_2d(ctx0, srt_val, 1, mr_tok, srt_val->nb[2], 0); // [1, tok]
+        // scale esige src0 contiguo: la vista va materializzata
+        ggml_tensor * thr = ggml_scale(ctx0, ggml_cont(ctx0, top1_val), g_moe_reduce_factor); // [1, tok]
+        // mask: 1 dove w2 >= X * top1 (step di w2 - thr, broadcast [1, tok])
+        ggml_tensor * mask = ggml_step(ctx0, ggml_sub(ctx0, w2, thr));          // [rows, tok]
+        ggml_tensor * masked  = ggml_mul(ctx0, w2, mask);
+        // rinormalizzazione massa-preservante: gli esperti mantenuti si dividono
+        // in proporzione la massa degli esclusi, la somma totale resta quella
+        // originale (identita' esatta quando la mask non esclude nulla; corretta
+        // sia per arch con norm_w=false — prob. softmax grezze, es. OLMoE —
+        // sia per arch gia' rinormalizzati a somma 1)
+        ggml_tensor * full_sum = ggml_sum_rows(ctx0, w2);                                     // [1, tok]
+        ggml_tensor * kept_sum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, masked), 1e-9f, INFINITY); // [1, tok]
+        w2 = ggml_mul(ctx0, masked, ggml_div(ctx0, full_sum, kept_sum));
+        ggml_tensor * kept = ggml_sum_rows(ctx0, mask); // [1, n_tokens] esperti mantenuti
+        ggml_set_output(kept);
+        ggml_build_forward_expand(gf, kept);
+        res->moe_reduce_kept[il] = kept;
+        weights = ggml_reshape_3d(ctx0, w2, 1, mr_rows, mr_tok);
+    }
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // moe-predict: log anche i layer NON espansi (routing stock top-K): qui
+    // weights e selected_experts sono definitivi per entrambi i rami e n_used
+    // vale n_expert_used (es. 8) — prediction su tutti i 40 layer
+    if (!moe_expand && ggml_moe_expert_log_enabled()) {
+        ggml_set_output(selected_experts);
+        ggml_build_forward_expand(gf, selected_experts);
+        ggml_set_output(weights);
+        ggml_build_forward_expand(gf, weights);
+        res->moe_expert_logs[il] = { selected_experts, weights, (int) n_tokens, (int) n_used, (int) n_expert,
+            { gate_up_exps ? gate_up_exps : up_exps, gate_up_exps ? down_exps : gate_exps, down_exps } };
     }
 
     //call early so that topk-moe can be used
@@ -2383,8 +2539,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
-        // repeat cur to [n_embd, n_expert_used, n_tokens]
-        ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+        // repeat cur to [n_embd, n_used, n_tokens]
+        ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
     }
@@ -2405,6 +2561,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
+        // moe-bracket: stima out_hi = out_lo + alpha * mul_mat_id(steps, blocksums(x))
+        if (g_moe_bracket_on && il >= 0 && g_moe_bracket_map.count(il) && cur->ne[0] % 32 == 0) {
+            ggml_tensor * S = ggml_sum_rows(ctx0, ggml_reshape_4d(ctx0, cur, 32, cur->ne[0]/32, cur->ne[1], cur->ne[2]));
+            S = ggml_reshape_3d(ctx0, S, cur->ne[0]/32, cur->ne[1], cur->ne[2]);
+            fprintf(stderr, "BRACKETDBG il=%d sito=gate_up bs0=%p buf=%p\n", il, (void*)g_moe_bracket_map[il][0], g_moe_bracket_map[il][0] ? (void*)g_moe_bracket_map[il][0]->buffer : nullptr);
+            ggml_tensor * corr = ggml_scale(ctx0, ggml_mul_mat_id(ctx0, g_moe_bracket_map[il][0], S, selected_experts), g_moe_bracket_alpha);
+            gate_up = ggml_add(ctx0, gate_up, corr);
+            cb(gate_up, "ffn_moe_gate_up_bracket", il);
+        }
 
         const int64_t n_ff = gate_up->ne[0] / 2;
         cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
@@ -2424,12 +2589,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
+        // moe-bracket: up
+        if (g_moe_bracket_on && il >= 0 && g_moe_bracket_map.count(il) && cur->ne[0] % 32 == 0) {
+            ggml_tensor * S = ggml_sum_rows(ctx0, ggml_reshape_4d(ctx0, cur, 32, cur->ne[0]/32, cur->ne[1], cur->ne[2]));
+            S = ggml_reshape_3d(ctx0, S, cur->ne[0]/32, cur->ne[1], cur->ne[2]);
+            fprintf(stderr, "BRACKETDBG il=%d sito=up bs2=%p buf=%p\n", il, (void*)g_moe_bracket_map[il][2], g_moe_bracket_map[il][2] ? (void*)g_moe_bracket_map[il][2]->buffer : nullptr);
+            ggml_tensor * corr = ggml_scale(ctx0, ggml_mul_mat_id(ctx0, g_moe_bracket_map[il][2], S, selected_experts), g_moe_bracket_alpha);
+            up = ggml_add(ctx0, up, corr);
+            cb(up, "ffn_moe_up_bracket", il);
+        }
 
+        ggml_tensor * moe_gate_in = cur;
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
+        }
+        // moe-bracket: gate
+        if (g_moe_bracket_on && il >= 0 && g_moe_bracket_map.count(il) && moe_gate_in->ne[0] % 32 == 0) {
+            ggml_tensor * S = ggml_sum_rows(ctx0, ggml_reshape_4d(ctx0, moe_gate_in, 32, moe_gate_in->ne[0]/32, moe_gate_in->ne[1], moe_gate_in->ne[2]));
+            S = ggml_reshape_3d(ctx0, S, moe_gate_in->ne[0]/32, moe_gate_in->ne[1], moe_gate_in->ne[2]);
+            fprintf(stderr, "BRACKETDBG il=%d sito=gate bs1=%p buf=%p\n", il, (void*)g_moe_bracket_map[il][1], g_moe_bracket_map[il][1] ? (void*)g_moe_bracket_map[il][1]->buffer : nullptr);
+            ggml_tensor * corr = ggml_scale(ctx0, ggml_mul_mat_id(ctx0, g_moe_bracket_map[il][1], S, selected_experts), g_moe_bracket_alpha);
+            cur = ggml_add(ctx0, cur, corr);
+            cb(cur, "ffn_moe_gate_bracket", il);
         }
 
         if (gate_exps_s) {
@@ -2546,6 +2730,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (amax_src1.scale_s) {
             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
         }
+
+    // moe-bracket: down
+    if (g_moe_bracket_on && il >= 0 && g_moe_bracket_map.count(il) && cur->ne[0] % 32 == 0) {
+        ggml_tensor * S = ggml_sum_rows(ctx0, ggml_reshape_4d(ctx0, cur, 32, cur->ne[0]/32, cur->ne[1], cur->ne[2]));
+        S = ggml_reshape_3d(ctx0, S, cur->ne[0]/32, cur->ne[1], cur->ne[2]);
+        ggml_tensor * corr = ggml_scale(ctx0, ggml_mul_mat_id(ctx0, g_moe_bracket_map[il][3], S, selected_experts), g_moe_bracket_alpha);
+        experts = ggml_add(ctx0, experts, corr);
+        cb(experts, "ffn_moe_down_bracket", il);
+    }
     }
 
     if (down_exps_s) {
@@ -2579,7 +2772,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Use per-layer n_expert_used to bound the graph even during warmup (avoids
     // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    // with expert expansion, the selection carries n_used slots per token
+    const uint32_t n_expert_used_il = moe_expand ? (uint32_t) n_used : hparams.n_expert_used(il);
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 

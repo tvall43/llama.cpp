@@ -4,6 +4,10 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+
+#if defined(AGRILLA_HAS_CUDA)
+extern "C" void ggml_cuda_moe_prefetch(const void * ptr, size_t size, int device);
+#endif
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -17,7 +21,12 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <array>
+#include <map>
 #include <cstring>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -242,6 +251,100 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+
+    // MoE expert expansion: validate the request, resolve the layer range
+    // against the loaded model and print the startup banner. the routing
+    // change itself happens in llm_graph_context::build_moe_ffn.
+    if (params.moe_experts != 0 || params.moe_experts_add != 0) {
+        if (params.moe_experts != 0 && params.moe_experts_add != 0) {
+            throw std::runtime_error("moe expert expansion: moe_experts and moe_experts_add are mutually exclusive");
+        }
+        if (hparams.n_expert == 0 || hparams.n_expert_used() == 0) {
+            throw std::runtime_error("moe expert expansion: model is not MoE (expert_count/expert_count_used missing)");
+        }
+        if (hparams.n_expert_groups > 1) {
+            throw std::runtime_error("moe expert expansion: grouped expert routing (n_expert_groups > 1) is not supported");
+        }
+
+        const int32_t n_layer = (int32_t) hparams.n_layer();
+        const int32_t k       = (int32_t) hparams.n_expert_used();
+
+        const int32_t n = params.moe_experts != 0 ?
+            params.moe_experts : k + params.moe_experts_add;
+        if (n < 2) {
+            throw std::runtime_error("moe expert expansion: N must be >= 2 (reference rank N/2)");
+        }
+        if (n > (int32_t) hparams.n_expert) {
+            throw std::runtime_error("moe expert expansion: N = " + std::to_string(n) +
+                    " exceeds expert_count = " + std::to_string(hparams.n_expert));
+        }
+        if (params.moe_expert_threshold < 0.0f || params.moe_expert_threshold > 10.0f) {
+            throw std::runtime_error("moe expert expansion: threshold must be in (0, 10] (0 disables)");
+        }
+        if (params.moe_expert_decay_end <= 0.0f || params.moe_expert_decay_end >= 0.99f) {
+            throw std::runtime_error("moe expert expansion: decay end factor must be in (0, 0.99)");
+        }
+        if (params.moe_expert_renorm != LLAMA_MOE_EXPERT_RENORM_AUTO &&
+            params.moe_expert_renorm != LLAMA_MOE_EXPERT_RENORM_ALWAYS &&
+            params.moe_expert_renorm != LLAMA_MOE_EXPERT_RENORM_NEVER) {
+            throw std::runtime_error("moe expert expansion: invalid renormalization mode");
+        }
+
+        // layer range: values < 1 are a fraction of n_layer, values >= 1 an absolute layer index
+        auto clamp_idx = [&](int32_t il) { return std::min(std::max(0, il), n_layer - 1); };
+        const int32_t il_start = params.moe_expert_layer_start <= 0.0f ? 0 :
+            params.moe_expert_layer_start < 1.0f ?
+                clamp_idx((int32_t) (params.moe_expert_layer_start * n_layer)) :
+                clamp_idx((int32_t) params.moe_expert_layer_start);
+        const int32_t il_end = params.moe_expert_layer_end < 0.0f ? n_layer - 1 :
+            params.moe_expert_layer_end < 1.0f ?
+                clamp_idx((int32_t) ceilf(params.moe_expert_layer_end * n_layer) - 1) :
+                clamp_idx((int32_t) params.moe_expert_layer_end);
+        if (il_start > il_end) {
+            throw std::runtime_error("moe expert expansion: layer start > layer end");
+        }
+
+        cparams.moe_experts         = n;
+        cparams.moe_experts_native  = k;
+        cparams.moe_expert_renorm   = params.moe_expert_renorm;
+        cparams.moe_expert_threshold   = params.moe_expert_threshold;
+        cparams.moe_expert_decay_end   = params.moe_expert_decay_end;
+        cparams.moe_no_expert_decay    = params.moe_no_expert_decay;
+        cparams.moe_layer_start = il_start;
+        cparams.moe_layer_end   = il_end;
+
+        // observability: experts/token stats every N decoded tokens (env-overridable, 0 = off)
+        if (const char * env = getenv("LLAMA_MOE_EXPERT_STATS_EVERY")) {
+            cparams.moe_stats_every = (uint32_t) strtoul(env, nullptr, 10);
+        } else {
+            cparams.moe_stats_every = 128;
+        }
+
+        // printed straight to stderr (like ds4): the common log system maps
+        // LLAMA_LOG_INFO to trace-level verbosity, which is filtered by default
+        if (n > k) {
+            if (params.moe_no_expert_decay) {
+                fprintf(stderr, "moe: routed experts per token: %d (model default %d; extra experts at full influence, decay disabled)\n", n, k);
+            } else {
+                fprintf(stderr, "moe: routed experts per token: %d (model default %d; ranks %d..%d get linear influence decay 0.99..%.2f)\n",
+                        n, k, k + 1, n, params.moe_expert_decay_end);
+            }
+        } else {
+            fprintf(stderr, "moe: routed experts per token: %d (model default %d)\n", n, k);
+        }
+        if (params.moe_expert_threshold > 0.0f) {
+            const int32_t min_used = std::max(1, n / 4);
+            fprintf(stderr, "moe: expert threshold: keep experts while p >= %.2f x p(rank %d) (experts %d..%d per token)\n",
+                    params.moe_expert_threshold, n / 2, min_used, n);
+        }
+        fprintf(stderr, "moe: expansion active on layers %d..%d of %d\n", il_start, il_end, n_layer);
+        if (params.moe_expert_renorm == LLAMA_MOE_EXPERT_RENORM_ALWAYS) {
+            fprintf(stderr, "moe: kept-weight renormalization: always (softmax-style sum-to-1)\n");
+        } else if (params.moe_expert_renorm == LLAMA_MOE_EXPERT_RENORM_NEVER) {
+            fprintf(stderr, "moe: kept-weight renormalization: never (raw decayed score scale kept)\n");
+        }
+        // auto: segue la normalizzazione stock del modello (renorm solo se expert_weights_norm=true)
+    }
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -1674,7 +1777,296 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+struct moe_chunk_state_t {
+    bool enabled = false;
+    int  budget  = 24;   // max esperti predetti per layer
+    int  topk    = 4;    // successori per esperto sorgente
+    int  horizon = 4;    // layer da predire avanti da un confine
+    int  device  = 0;
+    std::set<int> after;                                  // layer confine
+    std::unordered_map<const void *, std::pair<int, int>> watch; // tensore -> (layer, e_ids?)
+    std::map<std::pair<int,int>, std::array<int32_t, 512>> trans; // (L,e) -> conteggio successori
+    std::map<int, std::vector<int32_t>> last_kept;        // kept correnti per layer
+    std::map<int, std::vector<int32_t>> observed_ids;     // ids letti in attesa dei weights
+    const std::map<int, llm_graph_result::llm_moe_log> * cur_logs = nullptr;
+} g_moe_chunk;
+
+static bool moe_chunk_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (!t) return false;
+    if (ask) {
+        return g_moe_chunk.watch.count(t) > 0;
+    }
+    // ask == false: il backend e' sincronizzato, i dati sono pronti
+    auto it = g_moe_chunk.watch.find(t);
+    if (it == g_moe_chunk.watch.end()) return true;
+    const int il   = it->second.first;
+    const int kind = it->second.second;   // 0 = ids, 1 = weights
+
+    // recupera i tensori del layer dallo stato del grafo corrente
+    // (set prima del compute in process_ubatch)
+    const auto logs_it2 = g_moe_chunk.cur_logs->find(il);
+    if (logs_it2 == g_moe_chunk.cur_logs->end()) return true;
+    const auto & st = logs_it2->second;
+    if (st.n_tokens <= 0 || st.n_used <= 0 || st.n_expert <= 0) return true;
+
+    std::vector<int32_t> ids(st.n_used * st.n_tokens);
+    ggml_backend_tensor_get(st.ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+
+    if (kind == 0) {
+        // ids osservato: memorizza in attesa dei pesi
+        g_moe_chunk.observed_ids[il] = std::move(ids);
+        return true;
+    }
+    // weights osservato: readback e guardia di plausibilita'
+    auto idit = g_moe_chunk.observed_ids.find(il);
+    if (idit == g_moe_chunk.observed_ids.end()) return true;
+    ids = std::move(idit->second);
+    g_moe_chunk.observed_ids.erase(idit);
+
+    std::vector<float> wgt(st.n_used * st.n_tokens);
+    ggml_backend_tensor_get(st.weights, wgt.data(), 0, wgt.size() * sizeof(float));
+    bool plausible = true;
+    for (size_t k = 0; plausible && k < ids.size(); ++k) {
+        if (ids[k] < 0 || ids[k] >= st.n_expert) plausible = false;
+    }
+    for (size_t k = 0; plausible && k < wgt.size(); ++k) {
+        if (!(wgt[k] >= 0.0f)) plausible = false;
+    }
+    if (!plausible) return true;
+
+    // kept dell'ultimo token dell'ubatch
+    std::vector<int32_t> kept;
+    const int tlast = st.n_tokens - 1;
+    for (int r = 0; r < st.n_used; ++r) {
+        if (wgt[r * st.n_tokens + tlast] > 1e-6f) {
+            kept.push_back(ids[r * st.n_tokens + tlast]);
+        }
+    }
+    g_moe_chunk.last_kept[il] = kept;
+
+    // aggiorna la riga di transizione (L, e) con i successori osservati qui
+    for (int32_t e : kept) {
+        auto & row = g_moe_chunk.trans[{il, e}];
+        for (int32_t s2 : kept) {
+            if (s2 >= 0 && (size_t) s2 < row.size()) row[s2]++;
+        }
+    }
+
+    // boundary? predici e prefetcha i layer successivi
+    if (!g_moe_chunk.after.count(il)) return true;
+#if defined(AGRILLA_HAS_CUDA)
+    int prev_L = il;
+    std::vector<int32_t> cur = kept;
+    for (int hop = 1; hop <= g_moe_chunk.horizon; ++hop) {
+        const int Lp = il + hop;
+        auto logs_next = g_moe_chunk.cur_logs->find(Lp);
+        if (logs_next == g_moe_chunk.cur_logs->end()) break;
+        // predizione: unione dei top-k successori per esperto del set corrente
+        std::vector<int32_t> pred;
+        std::set<int32_t> seen;
+        for (int32_t e : cur) {
+            auto tit = g_moe_chunk.trans.find({prev_L, e});
+            if (tit == g_moe_chunk.trans.end()) continue;
+            const auto & row = tit->second;
+            // top-k per conteggio
+            std::vector<std::pair<int32_t, int32_t>> ranked;
+            for (size_t s2 = 0; s2 < row.size(); ++s2) {
+                if (row[s2] > 0) ranked.push_back({(int32_t) s2, row[s2]});
+            }
+            std::partial_sort(ranked.begin(),
+                              ranked.begin() + std::min<size_t>(g_moe_chunk.topk, ranked.size()),
+                              ranked.end(),
+                              [](const auto & a, const auto & b) { return a.second > b.second; });
+            for (size_t i = 0; i < std::min<size_t>(g_moe_chunk.topk, ranked.size()); ++i) {
+                if (seen.insert(ranked[i].first).second) pred.push_back(ranked[i].first);
+                if ((int) pred.size() >= g_moe_chunk.budget) break;
+            }
+            if ((int) pred.size() >= g_moe_chunk.budget) break;
+        }
+        if (pred.empty()) break;
+        // prefetch dei candidati per il layer Lp
+        const auto & stn = logs_next->second;
+        for (int k = 0; k < 3; ++k) {
+            ggml_tensor * tt = stn.exps[k];
+            if (!tt || !tt->data || tt->nb[2] == 0) continue;
+            const char * base = (const char *) tt->data;
+            for (int32_t e : pred) {
+                if (e < 0 || (size_t) e >= (size_t) stn.n_expert) continue;
+                ggml_cuda_moe_prefetch(base + (size_t) e * tt->nb[2], (size_t) tt->nb[2], g_moe_chunk.device);
+            }
+        }
+        prev_L = Lp;
+        cur = pred;
+        // se Lp e' a sua volta un confine, il prossimo ask=false fornira' il routing reale
+        if (g_moe_chunk.after.count(Lp)) break;
+    }
+#endif
+    return true;
+}
+
+// ===== moe-bracket (A1/A2): correzione bracket dell'errore di quantizzazione =====
+// LLAMA_MOE_BRACKET=1: al primo ubatch estrae da ogni tensore esperto lo step di
+// quantizzazione per blocco-32 (dai byte di scala del formato Q4_K/Q8_0/Q4_0) e
+// crea tensori Q8_0 [n_blocks, n_out, n_exp] su CPU. Il grafo aggiunge a ogni
+// esperto: alpha * mul_mat_id(bs, blocksums(x), ids) ~= stima di out_hi;
+// alpha=0.5 -> media (out_lo + out_hi)/2 (A1); alpha calibrabile (A2).
+std::map<int, std::array<ggml_tensor *, 4>> g_moe_bracket_map; // [0]=gate_up [1]=gate [2]=up [3]=down
+float g_moe_bracket_alpha = 0.5f;
+bool  g_moe_bracket_on    = false;
+
+static inline float moe_bs_hf16(const char * p) {
+    uint16_t h;
+    memcpy(&h, p, 2);
+    const uint32_t sign = (h & 0x8000u) << 16;
+    const uint32_t exp  = (h & 0x7C00u) >> 10;
+    const uint32_t man  = (h & 0x03FFu);
+    uint32_t bits;
+    if (exp == 0)       bits = sign;
+    else if (exp == 31) bits = sign | 0x7F800000u | (man << 13);
+    else                bits = sign | ((exp - 15u + 127u) << 23) | (man << 13);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static void moe_bs_get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else { *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4); *m = (q[j+4] >> 4) | ((q[j] >> 6) << 4); }
+}
+
+static bool moe_bs_parse(const ggml_tensor * t, const char * host, std::vector<float> & steps) {
+    if (t->ne[0] % 32 != 0) return false;
+    const int64_t nb32 = t->ne[0] / 32;
+    steps.assign(nb32 * t->ne[1] * t->ne[2], 0.0f);
+    if (t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K) {
+        const int64_t rsize = ggml_row_size(t->type, t->ne[0]);
+        const int64_t nb256 = t->ne[0] / 256;
+        for (int64_t e = 0; e < t->ne[2]; ++e)
+        for (int64_t o = 0; o < t->ne[1]; ++o) {
+            const char * row = host + (e * t->ne[1] + o) * rsize;
+            float * out = steps.data() + (e * t->ne[1] + o) * nb32;
+            for (int64_t b = 0; b < nb256; ++b) {
+                const char * blk = row + b * 144;
+                const float d = moe_bs_hf16(blk);
+                for (int j = 0; j < 8; ++j) {
+                    uint8_t sc, m;
+                    moe_bs_get_scale_min_k4(j, (const uint8_t *) blk + 4, &sc, &m);
+                    out[8 * b + j] = d * (float) sc;
+                }
+            }
+        }
+    } else if (t->type == GGML_TYPE_Q8_0) {
+        const int64_t rsize = ggml_row_size(GGML_TYPE_Q8_0, t->ne[0]);
+        for (int64_t e = 0; e < t->ne[2]; ++e)
+        for (int64_t o = 0; o < t->ne[1]; ++o) {
+            const char * row = host + (e * t->ne[1] + o) * rsize;
+            float * out = steps.data() + (e * t->ne[1] + o) * nb32;
+            for (int64_t b = 0; b < nb32; ++b) out[b] = moe_bs_hf16(row + b * 34);
+        }
+    } else if (t->type == GGML_TYPE_Q4_0) {
+        const int64_t rsize = ggml_row_size(GGML_TYPE_Q4_0, t->ne[0]);
+        for (int64_t e = 0; e < t->ne[2]; ++e)
+        for (int64_t o = 0; o < t->ne[1]; ++o) {
+            const char * row = host + (e * t->ne[1] + o) * rsize;
+            float * out = steps.data() + (e * t->ne[1] + o) * nb32;
+            for (int64_t b = 0; b < nb32; ++b) out[b] = moe_bs_hf16(row + b * 18);
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static int64_t moe_bs_q8_quantize(const float * steps, int64_t n, char * dst) {
+    const int64_t nb = n / 32;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float * src = steps + b * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, fabsf(src[i]));
+        const float d = amax / 127.0f;
+        uint16_t dh;
+        {
+            float f = d;
+            uint32_t bits;
+            memcpy(&bits, &f, 4);
+            const uint32_t lsb = (bits >> 16) & 1u;
+            uint32_t h = ((bits >> 16) & 0x8000u) | (((bits >> 23) - 127 + 15) << 10) | ((bits >> 13) & 0x3FFu);
+            h += lsb;
+            memcpy(&dh, &h, 2);
+        }
+        memcpy(dst + b * 34, &dh, 2);
+        int8_t * q = (int8_t *) (dst + b * 34 + 2);
+        const float id = (d == 0.0f) ? 0.0f : 1.0f / d;
+        for (int i = 0; i < 32; ++i) q[i] = (int8_t) roundf(src[i] * id);
+    }
+    return nb * 34;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // moe-bracket: estrazione una tantum degli step per blocco dai tensori esperti
+    static bool moe_bracket_init = false;
+    if (!moe_bracket_init) {
+        moe_bracket_init = true;
+        if (getenv("LLAMA_MOE_BRACKET")) {
+            g_moe_bracket_on = true;
+            if (const char * a = getenv("LLAMA_MOE_BRACKET_ALPHA")) g_moe_bracket_alpha = atof(a);
+            if (!moe_bracket_ctx) {
+                ggml_init_params ip = { /*mem_size*/ 64 * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+                moe_bracket_ctx = ggml_init(ip);
+            }
+            int nok = 0, nskip = 0;
+            for (int il = 0; il < (int) model.layers.size(); ++il) {
+                const auto & L = model.layers[il];
+                const std::pair<ggml_tensor *, int> src[4] = {
+                    { L.ffn_gate_up_exps, 0 }, { L.ffn_gate_exps, 1 },
+                    { L.ffn_up_exps, 2 }, { L.ffn_down_exps, 3 },
+                };
+                bool any = false, all_ok = true;
+                std::array<ggml_tensor *, 4> bs = { nullptr, nullptr, nullptr, nullptr };
+                for (const auto & [t, slot] : src) {
+                    if (!t) continue;
+                    any = true;
+                    if (t->type != GGML_TYPE_Q4_K && t->type != GGML_TYPE_Q5_K && t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) {
+                        LLAMA_LOG_WARN("moe-bracket: layer %d tipo %s non supportato, layer escluso dal bracket\n",
+                                       il, ggml_type_name(t->type));
+                        all_ok = false; break;
+                    }
+                    if (t->ne[0] % 32 != 0) { all_ok = false; break; }
+                    std::vector<char> host(ggml_nbytes(t));
+                    ggml_backend_tensor_get(t, host.data(), 0, host.size());
+                    std::vector<float> steps;
+                    if (!moe_bs_parse(t, host.data(), steps)) { all_ok = false; break; }
+                    const int64_t nb32 = t->ne[0] / 32;
+                    std::vector<char> q((nb32 / 32) * 34 * t->ne[1] * t->ne[2]);
+                    for (int64_t e = 0; e < t->ne[2]; ++e)
+                    for (int64_t o = 0; o < t->ne[1]; ++o) {
+                        moe_bs_q8_quantize(steps.data() + (e * t->ne[1] + o) * nb32, nb32,
+                                           q.data() + (e * t->ne[1] + o) * (nb32 / 32) * 34);
+                    }
+                    ggml_tensor * bten = ggml_new_tensor_3d(moe_bracket_ctx, GGML_TYPE_Q8_0, nb32, t->ne[1], t->ne[2]);
+                    // buffer CPU manuale: senza buffer il grafo crasha al warmup
+                    void * bs_data = nullptr;
+                    if (posix_memalign(&bs_data, 64, ggml_nbytes(bten)) != 0) { all_ok = false; break; }
+                    bten->data   = bs_data;
+                    bten->buffer = ggml_backend_cpu_buffer_from_ptr(bs_data, ggml_nbytes(bten));
+                    bs[slot] = bten;
+                    // tensore su CPU: memcpy diretto (tensor_set filtra per buffer
+                    // e qui il buffer from_ptr non serve al set)
+                    memcpy(bten->data, q.data(), q.size());
+                }
+                if (any && all_ok) {
+                    g_moe_bracket_map[il] = bs;
+                    nok++;
+                } else if (any) {
+                    nskip++;
+                }
+            }
+            LLAMA_LOG_INFO("%s: moe-bracket attivo (alpha %.2f): %d layer con bracket, %d esclusi\n",
+                           __func__, g_moe_bracket_alpha, nok, nskip);
+        }
+    }
+
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1737,11 +2129,334 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // moe chunked decode: stato della callback e watch set per questo grafo
+    {
+        static const bool chunk_enabled = getenv("LLAMA_MOE_CHUNK_PREDICT") != nullptr;
+        if (chunk_enabled) {
+            if (!g_moe_chunk.enabled) {
+                g_moe_chunk.enabled = true;
+                if (const char * e = getenv("LLAMA_MOE_PREDICT_BUDGET"))  g_moe_chunk.budget  = std::max(1, atoi(e));
+                if (const char * e = getenv("LLAMA_MOE_PREDICT_TOPK"))    g_moe_chunk.topk    = std::max(1, atoi(e));
+                if (const char * e = getenv("LLAMA_MOE_PREDICT_HORIZON")) g_moe_chunk.horizon = std::max(1, atoi(e));
+                if (const char * e = getenv("LLAMA_MOE_PREFETCH_DEVICE")) g_moe_chunk.device  = atoi(e);
+                if (const char * e = getenv("LLAMA_MOE_CHUNK_AFTER")) {
+                    // lista di layer confine separati da virgole
+                    int L = 0; bool any = false;
+                    for (const char * p = e; ; ++p) {
+                        if (*p >= '0' && *p <= '9') { L = L*10 + (*p - '0'); any = true; }
+                        else if (*p == ',' || *p == '\0') { if (any) g_moe_chunk.after.insert(L); L = 0; any = false; if (!*p) break; }
+                    }
+                } else {
+                    // default: ogni 3-esimo layer loggato come confine
+                    int i = 0;
+                    for (const auto & [il, st] : res->moe_expert_logs) {
+                        if ((i + 1) % 3 == 0) g_moe_chunk.after.insert(il);
+                        i++;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: moe chunked predict attivo (budget %d, topk %d, horizon %d, confini %s)\n",
+                               __func__, g_moe_chunk.budget, g_moe_chunk.topk, g_moe_chunk.horizon,
+                               [&](){ std::string r; for (int b : g_moe_chunk.after) r += std::to_string(b) + ","; return r; }().c_str());
+            }
+            g_moe_chunk.cur_logs = &res->moe_expert_logs;
+            g_moe_chunk.watch.clear();
+            if (ubatch.n_tokens == 1) {
+                for (const auto & [il, st] : res->moe_expert_logs) {
+                    if (!g_moe_chunk.after.count(il)) continue;
+                    g_moe_chunk.watch[st.ids]     = {il, 0};
+                    g_moe_chunk.watch[st.weights] = {il, 1};
+                }
+            }
+            ggml_backend_sched_set_eval_callback(sched.get(), moe_chunk_cb, nullptr);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // ===== moe-predict: logger JSONL + prefetch predittivo degli esperti =====
+    //   LLAMA_MOE_EXPERT_LOG=file.jsonl      log per token (layer x layer)
+    //   LLAMA_MOE_EXPERT_PREFETCH=1          prefetch temporale (set corrente -> prossimo token)
+    //   LLAMA_MOE_CHUNK_PREDICT=1            chunked decode stile DS4: ai confini di chunk
+    //                                        (LLAMA_MOE_CHUNK_AFTER="26,29,32,35,38") lo sched
+    //                                        sincronizza, qui si legge il routing reale e si
+    //                                        prefetchano i candidati dei layer successivi mentre
+    //                                        il chunk corrente termina (cudaMemPrefetchAsync)
+    // Tutti richiedono l'esposizione dei tensori di routing (moe_expert_logs).
+    if (!res->moe_expert_logs.empty() && !cparams.warmup && ubatch.n_tokens > 0) {
+        static FILE * moe_log_file = []() -> FILE * {
+            const char * path = getenv("LLAMA_MOE_EXPERT_LOG");
+            return path ? fopen(path, "a") : nullptr;
+        }();
+        static const int moe_log_every = []() {
+            const char * e = getenv("LLAMA_MOE_EXPERT_LOG_EVERY");
+            return e ? std::max(1, atoi(e)) : 1;
+        }();
+        static int moe_log_counter = 0;
+        static const bool moe_prefetch = getenv("LLAMA_MOE_EXPERT_PREFETCH") != nullptr;
+        static const int  moe_prefetch_dev = []() {
+            const char * e = getenv("LLAMA_MOE_PREFETCH_DEVICE");
+            return e ? atoi(e) : 0;
+        }();
+        static const int  moe_static_every = []() {
+            const char * e = getenv("LLAMA_MOE_PREFETCH_STATIC_EVERY");
+            return e ? std::max(8, atoi(e)) : 64;
+        }();
+        static const int  moe_static_topn  = []() {
+            const char * e = getenv("LLAMA_MOE_PREFETCH_STATIC");
+            return e ? std::max(1, atoi(e)) : 24;
+        }();
+        static std::map<int, std::array<int32_t, 512>> moe_freq;   // layer -> conteggio esperto
+        static long moe_decode_tokens = 0;
+        const bool do_log = moe_log_file && (moe_log_counter++ % moe_log_every) == 0;
+
+        if (do_log || moe_prefetch || g_moe_chunk.enabled) {
+            const char Q = '"';
+            std::string line;
+            if (do_log) {
+                line += '{';
+                line += Q; line += "pos0"; line += Q; line += ':';
+                line += std::to_string(ubatch.pos ? ubatch.pos[0] : 0);
+                line += ','; line += Q; line += 'n'; line += Q; line += ':';
+                line += std::to_string((int) ubatch.n_tokens);
+                line += ','; line += Q; line += "layer"; line += Q; line += ':'; line += '{';
+            }
+            bool first_layer = true;
+            for (const auto & [il, st] : res->moe_expert_logs) {
+                const int n_tok = st.n_tokens;
+                const int n_used = st.n_used;
+                if (n_tok <= 0 || n_used <= 0 || ubatch.n_tokens <= 0) continue;
+                std::vector<int32_t> ids(n_used * n_tok);
+                std::vector<float>   wgt(n_used * n_tok);
+                ggml_backend_tensor_get(st.ids,     ids.data(), 0, ids.size() * sizeof(int32_t));
+                ggml_backend_tensor_get(st.weights, wgt.data(), 0, wgt.size() * sizeof(float));
+                // grafi con topologia diversa (es. passate MTP/nextn) possono lasciare
+                // i tensori non computati: readback di memoria non inizializzata.
+                bool plausible = st.n_expert > 0;
+                for (size_t k = 0; plausible && k < ids.size(); ++k) {
+                    if (ids[k] < 0 || ids[k] >= st.n_expert) plausible = false;
+                }
+                for (size_t k = 0; plausible && k < wgt.size(); ++k) {
+                    if (!(wgt[k] >= 0.0f)) plausible = false;  // scarta NaN/negativi
+                }
+                if (!plausible) continue;
+
+                // kept ids dell'ultimo token dell'ubatch
+                std::vector<int32_t> kept;
+                kept.reserve(n_used);
+                {
+                    const int t = n_tok - 1;
+                    auto & fc = moe_freq[il];
+                    for (int r = 0; r < n_used; ++r) {
+                        if (wgt[r * n_tok + t] > 1e-6f) {
+                            kept.push_back(ids[r * n_tok + t]);
+                            if (kept.back() >= 0 && (size_t) kept.back() < fc.size()) {
+                                fc[kept.back()]++;
+                            }
+                        }
+                    }
+                }
+
+                // conserva i kept di questo layer: servono per l'aggiornamento
+                // del modello di transizione L->L+1 fatto dopo il loop e per la
+                // predizione a confini di chunk
+                g_moe_chunk.last_kept[il] = kept;
+
+                // prefetch temporale: anticipa in VRAM i byte degli esperti appena usati
+                if (moe_prefetch && ubatch.n_tokens == 1 && !kept.empty()) {
+#if defined(AGRILLA_HAS_CUDA)
+                    for (int k = 0; k < 3; ++k) {
+                        ggml_tensor * t = st.exps[k];
+                        if (!t || !t->data || t->nb[2] == 0) continue;
+                        const char * base = (const char *) t->data;
+                        for (int32_t e : kept) {
+                            if (e < 0 || (size_t) e >= (size_t) st.n_expert) continue;
+                            ggml_cuda_moe_prefetch(base + (size_t) e * t->nb[2], (size_t) t->nb[2], moe_prefetch_dev);
+                        }
+                    }
+#endif
+                }
+
+                if (do_log) {
+                    if (!first_layer) line += ',';
+                    first_layer = false;
+                    line += Q; line += std::to_string(il); line += Q; line += ':'; line += '[';
+                    bool first_tok = true;
+                    for (int t = 0; t < n_tok && t < (int) ubatch.n_tokens; ++t) {
+                        if (!first_tok) line += ',';
+                        first_tok = false;
+                        line += '[';
+                        bool first_id = true;
+                        for (int r = 0; r < n_used; ++r) {
+                            if (wgt[r * n_tok + t] > 1e-6f) {
+                                if (!first_id) line += ',';
+                                first_id = false;
+                                line += std::to_string(ids[r * n_tok + t]);
+                            }
+                        }
+                        line += ']';
+                    }
+                    line += ']';
+                }
+            }
+            if (do_log) {
+                line += '}'; line += '}'; line += '\n';
+                fputs(line.c_str(), moe_log_file);
+                fflush(moe_log_file);
+            }
+
+            // modello di transizione L->L+1: aggiornamento con i kept di tutti i
+            // layer consecutivi del token corrente
+            if (g_moe_chunk.enabled && ubatch.n_tokens == 1) {
+                int prev_L = -1;
+                for (const auto & [il, st] : res->moe_expert_logs) {
+                    if (prev_L >= 0 && il == prev_L + 1) {
+                        const auto & prev = g_moe_chunk.last_kept[prev_L];
+                        const auto & cur  = g_moe_chunk.last_kept[il];
+                        for (int32_t e : prev) {
+                            auto & row = g_moe_chunk.trans[{prev_L, e}];
+                            for (int32_t s : cur) {
+                                if (s >= 0 && (size_t) s < row.size()) row[s]++;
+                            }
+                        }
+                    }
+                    prev_L = il;
+                }
+            }
+
+            // prefetch statico periodico: top-N per layer dalla statistica accumulata
+            if (moe_prefetch && ubatch.n_tokens == 1 &&
+                (moe_decode_tokens++ % moe_static_every) == 0) {
+#if defined(AGRILLA_HAS_CUDA)
+                for (const auto & [il, st] : res->moe_expert_logs) {
+                    auto it = moe_freq.find(il);
+                    if (it == moe_freq.end()) continue;
+                    const auto & fc = it->second;
+                    std::vector<std::pair<int32_t, int32_t>> ranked;
+                    ranked.reserve(fc.size());
+                    for (size_t e = 0; e < fc.size(); ++e) {
+                        if (fc[e] > 0) ranked.push_back({(int32_t) e, fc[e]});
+                    }
+                    std::partial_sort(ranked.begin(),
+                                      ranked.begin() + std::min<size_t>(moe_static_topn, ranked.size()),
+                                      ranked.end(),
+                                      [](const auto & a, const auto & b) { return a.second > b.second; });
+                    const size_t take = std::min<size_t>(moe_static_topn, ranked.size());
+                    for (int k = 0; k < 3; ++k) {
+                        ggml_tensor * t = st.exps[k];
+                        if (!t || !t->data || t->nb[2] == 0) continue;
+                        const char * base = (const char *) t->data;
+                        for (size_t i = 0; i < take; ++i) {
+                            ggml_cuda_moe_prefetch(base + (size_t) ranked[i].first * t->nb[2],
+                                                   (size_t) t->nb[2], moe_prefetch_dev);
+                        }
+                    }
+                }
+#endif
+            }
+        }
+    }
+
+    // MoE expert expansion observability: accumulate the per-layer selected
+    // expert counts and periodically report the experts/token averages
+    // (interval: cparams.moe_stats_every, env LLAMA_MOE_EXPERT_STATS_EVERY, 0 = off)
+    // skipped during warmup: probe/fitted graphs may leave some splits (hence
+    // the count tensors) uncomputed, which would read back garbage
+    extern float g_moe_reduce_factor;
+
+// moe-reduce: statistiche esperti mantenuti per layer (media ogni 32 build di grafo;
+// i token di decode riusano il grafo e non ripassano di qui, come per l'expansion)
+    if (g_moe_reduce_factor > 0.0f && !cparams.warmup && !res->moe_reduce_kept.empty()) {
+        static std::map<int, double> moe_reduce_sum;
+        static std::map<int, int64_t> moe_reduce_tok;
+        static int64_t moe_reduce_ub = 0;
+        for (const auto & [il, t] : res->moe_reduce_kept) {
+            std::vector<float> k(ggml_nbytes(t) / sizeof(float));
+            ggml_backend_tensor_get(t, k.data(), 0, k.size() * sizeof(float));
+            for (float v : k) { moe_reduce_sum[il] += v; }
+            moe_reduce_tok[il] += t->ne[1];
+        }
+        if (++moe_reduce_ub % 32 == 0) {
+            std::string line = "moe-reduce: esperti mantenuti avg:";
+            for (const auto & [il, s] : moe_reduce_sum) {
+                const int64_t tok = moe_reduce_tok[il];
+                line += " L" + std::to_string(il) + ": " + std::to_string(tok ? s / tok : 0.0).substr(0, 5);
+            }
+            LLAMA_LOG_INFO("%s (ultime 32 build)\n", line.c_str());
+            moe_reduce_sum.clear();
+            moe_reduce_tok.clear();
+            moe_reduce_ub = 0;
+        }
+    }
+
+    if (cparams.moe_stats_every > 0 && !cparams.warmup && !res->moe_expert_counts.empty()) {
+        if (moe_stats_acc.empty()) {
+            moe_stats_acc.resize(model.hparams.n_layer(), 0.0);
+            moe_stats_tok.resize(model.hparams.n_layer(), 0);
+        }
+
+        // the server runs more than one graph topology per request (e.g. the
+        // MTP/nextn head passes): in the graphs where an expanded layer's count
+        // tensor is not computed, the readback fails the bounds check below and
+        // that ubatch is simply not counted, instead of polluting the averages
+        uint32_t n_valid = 0;
+        for (const auto & [il, st] : res->moe_expert_counts) {
+            float cnt = 0.0f;
+            ggml_backend_tensor_get(st.sel_count, &cnt, 0, sizeof(cnt));
+            // every expanded token keeps at least F = max(1, N/4) and at most N
+            // experts: values outside [n*F, n*N] mean the tensor was not computed
+            const float min_cnt = (float) st.n_tokens * std::max(1, cparams.moe_experts / 4);
+            const float max_cnt = (float) st.n_tokens * cparams.moe_experts;
+            if (il >= 0 && il < (int) moe_stats_acc.size() && cnt >= min_cnt && cnt <= max_cnt) {
+                moe_stats_acc[il] += cnt;
+                moe_stats_tok[il] += st.n_tokens;
+                n_valid++;
+            }
+        }
+
+        if (n_valid == 0) {
+            ret = GGML_STATUS_SUCCESS;
+            return res;
+        }
+
+        moe_stats_tokens += ubatch.n_tokens;
+
+        if (moe_stats_tokens >= cparams.moe_stats_every) {
+            char buf[64];
+            std::string line = "moe: experts/token avg over " +
+                std::to_string(moe_stats_tokens) + " tokens:";
+
+            double sum = 0.0;
+            int nl = 0;
+            for (const auto & [il, st] : res->moe_expert_counts) {
+                if (moe_stats_tok[il] == 0) {
+                    continue;
+                }
+                const double avg = moe_stats_acc[il] / moe_stats_tok[il];
+                sum += avg;
+                nl++;
+                snprintf(buf, sizeof(buf), " L%d:%.1f", il, avg);
+                line += buf;
+            }
+
+            if (nl == 0) {
+                moe_stats_tokens = 0;
+                ret = GGML_STATUS_SUCCESS;
+                return res;
+            }
+            snprintf(buf, sizeof(buf), " | mean %.1f\n", sum / nl);
+            line += buf;
+            // stderr, see the startup banner comment above
+            fputs(line.c_str(), stderr);
+
+            std::fill(moe_stats_acc.begin(), moe_stats_acc.end(), 0.0);
+            std::fill(moe_stats_tok.begin(), moe_stats_tok.end(), 0);
+            moe_stats_tokens = 0;
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2764,6 +3479,21 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
 
+    const uint32_t n_sampling_outputs_max = std::min<uint64_t>(
+            std::min(n_tokens, cparams.n_outputs_max),
+            (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
+
+    // MoE expert expansion adds ~40 extra graph nodes per expanded MoE layer
+    // (intermediate tensors for the keep-mask, decay factors and renorm chain)
+    if (cparams.moe_experts > 0) {
+        res += model.hparams.n_layer() * 50;
+    }
+
+    res += n_sampling_nodes;
+    if (n_sampling_outputs_max > 1) {
+        res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
+    }
+
     if (cparams.training) {
         res *= 4;
     }
@@ -2953,6 +3683,13 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
 }
 
+
+// ===== moe-predict chunked decode (stile DS4) =====
+// A ogni confine di chunk lo sched sincronizza il backend e passa qui i tensori
+// di routing osservati: si legge il routing reale dell'ultimo layer del chunk,
+// si predicono i set dei layer del chunk successivo (catena di Markov L->L+1
+// addestrata online) e si prefetchano i byte dei candidati in VRAM mentre il
+// chunk successivo viene enqueuato ed eseguito.
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
@@ -4285,6 +5022,14 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.moe_experts                 =*/ 0,
+        /*.moe_experts_add             =*/ 0,
+        /*.moe_expert_threshold        =*/ 0.0f,
+        /*.moe_expert_decay_end        =*/ 0.5f,
+        /*.moe_no_expert_decay         =*/ false,
+        /*.moe_expert_layer_start      =*/ 0.0f,
+        /*.moe_expert_layer_end        =*/ -1.0f,
+        /*.moe_expert_renorm           =*/ LLAMA_MOE_EXPERT_RENORM_AUTO,
     };
 
     return result;
