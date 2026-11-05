@@ -397,8 +397,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
         const char * e = getenv("LLAMA_QSA_DENSE");
         return e != nullptr && atoi(e) != 0;
     }();
-    const bool qsa = !qsa_dense && inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il) : nullptr;
+    static const bool qsa_prefill_only = []() {
+        const char * e = getenv("LLAMA_QSA_PREFILL_ONLY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const bool qsa_cache = !qsa_dense && inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // Dense while the whole context fits the budget, and optionally dense for
+    // decode.  The cache update still runs, so crossing top_k needs no reprocess.
+    const bool qsa_use = qsa_cache && (n_tokens > 1 || !qsa_prefill_only) &&
+            inp_kpool->n_kv > hparams.indexer_top_k;
+    ggml_tensor * sel = qsa_cache ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il, qsa_use) : nullptr;
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
@@ -455,7 +463,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (qsa) {
+    if (qsa_use) {
         cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, inp_kpool->n_sel, kq_scale, il);
     } else {
         cur = build_attn(inp,
@@ -906,7 +914,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_qsa_sel(
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                                    do_select) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim = hparams.indexer_head_size;
@@ -958,6 +967,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_qsa_sel(
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
+
+    // the dense budget shortcut and the decode-dense mode still keep the
+    // indexer and pooled caches warm, so crossing top_k needs no reprocess
+    if (!do_select) {
+        return nullptr;
+    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);

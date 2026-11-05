@@ -2976,7 +2976,8 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor *         cur,
                     ggml_tensor *         inp_pos,
                             int *         sections,
-                            int           il);
+                            int           il,
+                           bool           do_select = true);
 
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
