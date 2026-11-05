@@ -401,11 +401,15 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
         const char * e = getenv("LLAMA_QSA_PREFILL_ONLY");
         return e != nullptr && atoi(e) != 0;
     }();
+    static const bool qsa_dense_below_k = []() {
+        const char * e = getenv("LLAMA_QSA_DENSE_BELOW_K");
+        return e == nullptr || atoi(e) != 0;
+    }();
     const bool qsa_cache = !qsa_dense && inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
     // Dense while the whole context fits the budget, and optionally dense for
     // decode.  The cache update still runs, so crossing top_k needs no reprocess.
     const bool qsa_use = qsa_cache && (n_tokens > 1 || !qsa_prefill_only) &&
-            inp_kpool->n_kv > hparams.indexer_top_k;
+            (!qsa_dense_below_k || inp_kpool->n_kv > hparams.indexer_top_k);
     ggml_tensor * sel = qsa_cache ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il, qsa_use) : nullptr;
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
