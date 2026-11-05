@@ -4575,7 +4575,7 @@ private:
                         if (params_base.checkpoint_every_nt > 0) {
                             llama_pos last_checkpoint = 0;
                             if (!slot.prompt.checkpoints.empty()) {
-                                last_checkpoint = slot.prompt.checkpoints.back().n_tokens;
+                                last_checkpoint = slot.prompt.checkpoints.back()->n_tokens;
                             }
 
                             if (slot.prompt.n_tokens() - n_tokens_cur - last_checkpoint < params_base.checkpoint_every_nt) {
