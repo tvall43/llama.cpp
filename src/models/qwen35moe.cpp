@@ -393,7 +393,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    static const bool qsa_dense = []() {
+        const char * e = getenv("LLAMA_QSA_DENSE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const bool qsa = !qsa_dense && inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il) : nullptr;
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
