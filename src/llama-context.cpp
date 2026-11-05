@@ -3479,19 +3479,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
 
-    const uint32_t n_sampling_outputs_max = std::min<uint64_t>(
-            std::min(n_tokens, cparams.n_outputs_max),
-            (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
-
     // MoE expert expansion adds ~40 extra graph nodes per expanded MoE layer
     // (intermediate tensors for the keep-mask, decay factors and renorm chain)
     if (cparams.moe_experts > 0) {
         res += model.hparams.n_layer() * 50;
-    }
-
-    res += n_sampling_nodes;
-    if (n_sampling_outputs_max > 1) {
-        res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
 
     if (cparams.training) {
