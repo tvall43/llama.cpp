@@ -3252,7 +3252,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
-                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
+                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP) ||
+                            ((arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && hparams.indexer_head_size > 0);
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
@@ -3271,7 +3272,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+                        if ((arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && hparams.indexer_head_size > 0) {
                             // QSA runs on the dense-attention layers only
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
