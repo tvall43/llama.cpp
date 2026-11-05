@@ -2962,11 +2962,36 @@ struct llama_model_qwen35moe : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    class llm_graph_input_kpool;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     private:
+        llm_graph_input_kpool * build_inp_kpool(
+  const llama_memory_hybrid_idx_context * mctx_hyb);
+
+        ggml_tensor * build_qsa_sel(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_kpool *           inp_kpool,
+                    ggml_tensor *         cur,
+                    ggml_tensor *         inp_pos,
+                            int *         sections,
+                            int           il);
+
+        ggml_tensor * build_attn_qsa(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * sel,
+                        int64_t   n_sel,
+                          float   kq_scale,
+                            int   il);
+
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
