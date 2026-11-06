@@ -72,6 +72,7 @@ struct llama_cparams {
     int32_t  moe_layer_start = 0;
     int32_t  moe_layer_end = 0;
     int32_t  moe_expert_renorm = 0; // kept-weight renormalization: 0 auto (follow stock), 1 always, 2 never
+    int32_t  moe_expert_scope = LLAMA_MOE_EXPERT_SCOPE_BOTH; // expansion phase: both, prefill, or decode
     uint32_t moe_stats_every = 0; // print experts/token stats every N decoded tokens (0 = off)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

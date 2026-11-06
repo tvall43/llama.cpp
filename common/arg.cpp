@@ -1783,6 +1783,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_RENORM"));
     add_opt(common_arg(
+        {"--moe-expert-scope", "--q35-expert-scope"}, "SCOPE",
+        "MoE expert expansion: phase to apply it to - 'both' (default), 'prefill' (ubatch n_tokens > 1), or 'decode' (ubatch n_tokens == 1); decode-only keeps the prompt and its KV cache at the native routing",
+        [](common_params & params, const std::string & value) {
+            if (value == "both")         params.moe_expert_scope = 0;
+            else if (value == "prefill") params.moe_expert_scope = 1;
+            else if (value == "decode")  params.moe_expert_scope = 2;
+            else throw std::invalid_argument("--moe-expert-scope must be both, prefill or decode");
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_SCOPE"));
+    add_opt(common_arg(
         {"--moe-expert-layer-start"}, "I",
         "MoE expert expansion: first transformer layer it applies to; fraction of n_layer if < 1 (e.g. 0.5 = second half), absolute index if >= 1 (default: 0 = all layers)",
         [](common_params & params, const std::string & value) {

@@ -438,6 +438,10 @@ extern "C" {
         #define LLAMA_MOE_EXPERT_RENORM_AUTO   0
         #define LLAMA_MOE_EXPERT_RENORM_ALWAYS 1
         #define LLAMA_MOE_EXPERT_RENORM_NEVER  2
+        // phase(s) in which the expansion is applied
+        #define LLAMA_MOE_EXPERT_SCOPE_BOTH    0
+        #define LLAMA_MOE_EXPERT_SCOPE_PREFILL 1
+        #define LLAMA_MOE_EXPERT_SCOPE_DECODE  2
         // raises the routed-expert budget above the model's native top-K with an optional
         // linear influence decay on the extra ranks. see docs/moe-expansion.md
         int32_t moe_experts;              // max routed experts per token N, absolute (0 = model default; exclusive with moe_experts_add)
@@ -448,6 +452,7 @@ extern "C" {
         float   moe_expert_layer_start;   // first layer the expansion applies to; < 1: fraction of n_layer, >= 1: layer index
         float   moe_expert_layer_end;     // last layer (inclusive); < 0: last layer, < 1: fraction of n_layer, >= 1: layer index
         int     moe_expert_renorm;        // kept-weight renormalization mode (LLAMA_MOE_EXPERT_RENORM_*)
+        int     moe_expert_scope;         // expansion phase (LLAMA_MOE_EXPERT_SCOPE_*; default BOTH)
     };
 
     struct llama_model_tensor_override {

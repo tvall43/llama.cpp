@@ -487,6 +487,7 @@ struct common_params {
     float   moe_expert_layer_start =  0.0f; // first layer with expansion; < 1: fraction of n_layer, >= 1: layer index
     float   moe_expert_layer_end   = -1.0f; // last layer (inclusive); < 0: last layer, < 1: fraction of n_layer, >= 1: layer index
     int32_t moe_expert_renorm      =  0;    // kept-weight renormalization: 0 auto (follow stock norm), 1 always, 2 never
+    int32_t moe_expert_scope       =  0;    // expansion phase: 0 both, 1 prefill (n_tokens > 1), 2 decode (n_tokens == 1)
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

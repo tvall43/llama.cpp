@@ -289,6 +289,11 @@ llama_context::llama_context(
             params.moe_expert_renorm != LLAMA_MOE_EXPERT_RENORM_NEVER) {
             throw std::runtime_error("moe expert expansion: invalid renormalization mode");
         }
+        if (params.moe_expert_scope != LLAMA_MOE_EXPERT_SCOPE_BOTH &&
+            params.moe_expert_scope != LLAMA_MOE_EXPERT_SCOPE_PREFILL &&
+            params.moe_expert_scope != LLAMA_MOE_EXPERT_SCOPE_DECODE) {
+            throw std::runtime_error("moe expert expansion: invalid scope");
+        }
 
         // layer range: values < 1 are a fraction of n_layer, values >= 1 an absolute layer index
         auto clamp_idx = [&](int32_t il) { return std::min(std::max(0, il), n_layer - 1); };
@@ -307,6 +312,7 @@ llama_context::llama_context(
         cparams.moe_experts         = n;
         cparams.moe_experts_native  = k;
         cparams.moe_expert_renorm   = params.moe_expert_renorm;
+        cparams.moe_expert_scope    = params.moe_expert_scope;
         cparams.moe_expert_threshold   = params.moe_expert_threshold;
         cparams.moe_expert_decay_end   = params.moe_expert_decay_end;
         cparams.moe_no_expert_decay    = params.moe_no_expert_decay;
@@ -338,6 +344,9 @@ llama_context::llama_context(
                     params.moe_expert_threshold, n / 2, min_used, n);
         }
         fprintf(stderr, "moe: expansion active on layers %d..%d of %d\n", il_start, il_end, n_layer);
+        fprintf(stderr, "moe: expansion phase: %s\n",
+                params.moe_expert_scope == LLAMA_MOE_EXPERT_SCOPE_PREFILL ? "prefill only" :
+                params.moe_expert_scope == LLAMA_MOE_EXPERT_SCOPE_DECODE  ? "decode only"  : "prefill+decode");
         if (params.moe_expert_renorm == LLAMA_MOE_EXPERT_RENORM_ALWAYS) {
             fprintf(stderr, "moe: kept-weight renormalization: always (softmax-style sum-to-1)\n");
         } else if (params.moe_expert_renorm == LLAMA_MOE_EXPERT_RENORM_NEVER) {
@@ -5021,6 +5030,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_expert_layer_start      =*/ 0.0f,
         /*.moe_expert_layer_end        =*/ -1.0f,
         /*.moe_expert_renorm           =*/ LLAMA_MOE_EXPERT_RENORM_AUTO,
+        /*.moe_expert_scope            =*/ LLAMA_MOE_EXPERT_SCOPE_BOTH,
     };
 
     return result;

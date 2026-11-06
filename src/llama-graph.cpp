@@ -2288,8 +2288,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // FFN without normalization (llama4) - those keep the native routing.
     // with the feature off (or N == K and no threshold) the graph is exactly
     // the stock one.
+    // Use the ubatch token count, not the per-layer n_tokens: the output-token
+    // optimization can shrink the late layers of a prefill graph, which would
+    // otherwise make the phase inconsistent across layers.  Decode-only is
+    // intended for single-sequence serving (--parallel 1); a batched decode
+    // with multiple tokens counts as prefill here.
+    const bool moe_scope_ok =
+        cparams.moe_expert_scope == LLAMA_MOE_EXPERT_SCOPE_BOTH ||
+        (cparams.moe_expert_scope == LLAMA_MOE_EXPERT_SCOPE_PREFILL && ubatch.n_tokens > 1) ||
+        (cparams.moe_expert_scope == LLAMA_MOE_EXPERT_SCOPE_DECODE  && ubatch.n_tokens == 1);
+
     const bool moe_expand =
         !cparams.warmup &&
+        moe_scope_ok &&
         cparams.moe_experts > 0 &&
         il >= cparams.moe_layer_start && il <= cparams.moe_layer_end &&
         gtype != LLM_GRAPH_TYPE_DECODER_MTP &&

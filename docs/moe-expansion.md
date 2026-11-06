@@ -114,6 +114,16 @@ All flags off → bit-identical to stock (hard requirement, verified below).
 | `--moe-expert-renorm MODE` | — | `auto` | kept-weight renormalization after cut+decay: `auto` follows the model's stock normalization (renorm iff `expert_weights_norm=true`), `always` forces sum-to-1, `never` keeps the raw decayed score scale |
 | `--moe-expert-layer-start I` | — | 0 | first layer the expansion applies to; `< 1`: fraction of n_layer, `≥ 1`: layer index |
 | `--moe-expert-layer-end I` | — | −1 | last layer (inclusive); `< 0`: last layer, `< 1`: fraction, `≥ 1`: index |
+| `--moe-expert-scope SCOPE` | — | `both` | phase to apply the expansion to: `both`, `prefill` (ubatch `n_tokens > 1`), or `decode` (ubatch `n_tokens == 1`); decode-only leaves the prompt and its KV cache at the native routing |
+
+`--moe-expert-scope` is a runtime experiment, not part of the original
+expansion recipe. The model was trained with its native top-K, so both phases
+are out of distribution; decode-only keeps the prompt/KV in distribution and
+applies the intervention only where loop reduction is observed, but it loses
+any prompt-encoding benefit and changes routing at the first generated token.
+Measure it per model. With parallel decoding, a decode batch can have more than
+one token and is classified as prefill; use `--parallel 1` for the intended
+split.
 
 The layer range is what makes the technique "layer-scoped" (per the paper, the
 budget expansion matters most in late layers): e.g. `--moe-expert-layer-start
